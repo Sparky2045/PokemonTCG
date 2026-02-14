@@ -1,0 +1,7 @@
+{
+  "name": "Pokemon Collection App",
+  "description": "Scan and manage your Pokemon card collection. Identify cards with your camera, get the latest prices in Euros, and track the total value of your collection.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
