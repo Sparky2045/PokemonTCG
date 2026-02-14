@@ -1,10 +1,7 @@
-// SCANNER OCR VERSION - 123
-
 import React, { useMemo, useState } from "react";
 import { PokemonCard } from "../types";
 import { searchCards } from "../services/pokemonService";
 
-// OCR wird nur geladen, wenn du wirklich scannst
 async function loadTesseract() {
   const mod = await import("https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js");
   return (mod as any).default || (window as any).Tesseract;
@@ -15,46 +12,99 @@ type Props = {
   onCardAdded: (card: PokemonCard) => void;
 };
 
+function eurFormat(v: number) {
+  return (v || 0).toLocaleString("de-DE", { style: "currency", currency: "EUR" });
+}
+
+// Bild vorbereiten: unteren Bereich croppen + hochskalieren + Kontrast (simple)
+async function preprocessBottomCrop(file: File): Promise<HTMLCanvasElement> {
+  const img = new Image();
+  img.src = URL.createObjectURL(file);
+  await new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error("Image load failed"));
+  });
+
+  // Crop: untere ~32% der Karte (da sitzt die Nummer)
+  const cropY = Math.floor(img.height * 0.68);
+  const cropH = img.height - cropY;
+  const cropW = img.width;
+
+  // Hochskalieren x2 für OCR
+  const scale = 2;
+  const canvas = document.createElement("canvas");
+  canvas.width = cropW * scale;
+  canvas.height = cropH * scale;
+  const ctx = canvas.getContext("2d")!;
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(img, 0, cropY, cropW, cropH, 0, 0, canvas.width, canvas.height);
+
+  // Simple Kontrast/Grayscale (hilft bei Glanz)
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = imageData.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    // grayscale
+    let v = (r * 0.299 + g * 0.587 + b * 0.114);
+    // contrast boost
+    v = (v - 128) * 1.35 + 128;
+    v = Math.max(0, Math.min(255, v));
+    d[i] = d[i + 1] = d[i + 2] = v;
+  }
+  ctx.putImageData(imageData, 0, 0);
+
+  return canvas;
+}
+
 export default function Scanner({ onClose, onCardAdded }: Props) {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string>("");
   const [results, setResults] = useState<PokemonCard[]>([]);
   const [error, setError] = useState<string>("");
+  const [debugText, setDebugText] = useState<string>("");
 
-  const eur = useMemo(
-    () => (v: number) => (v || 0).toLocaleString("de-DE", { style: "currency", currency: "EUR" }),
-    []
-  );
+  const eur = useMemo(() => eurFormat, []);
 
   async function handleFile(file: File) {
     setBusy(true);
     setError("");
     setResults([]);
+    setDebugText("");
     setStatus("OCR läuft… (10–30s)");
 
     try {
       const Tesseract = await loadTesseract();
-      const imgUrl = URL.createObjectURL(file);
 
-      const { data } = await Tesseract.recognize(imgUrl, "eng");
-      const text: string = data?.text || "";
+      // 1) Bild vorbereiten (unten croppen + verbessern)
+      const canvas = await preprocessBottomCrop(file);
+      const dataUrl = canvas.toDataURL("image/png");
 
-      // Suche nach Muster 80/198 oder 80 / 198
+      // 2) OCR mit Whitelist nur für Nummern + Slash
+      const result = await Tesseract.recognize(dataUrl, "eng", {
+        tessedit_char_whitelist: "0123456789/",
+        // PSM 6: block of text; PSM 7: single line (manchmal besser)
+        tessedit_pageseg_mode: "6",
+      });
+
+      const text: string = result?.data?.text || "";
+      setDebugText(text);
+
+      // robustere Regex: findet 082/159 auch mit Leerzeichen oder Zeilenumbrüchen
       const m = text.match(/(\d{1,3})\s*\/\s*(\d{1,3})/);
       if (!m) {
         setStatus("");
-        setError("Keine Kartennummer erkannt. Versuch ein schärferes Foto (Nummer unten gut sichtbar).");
+        setError("Keine Kartennummer erkannt. Tipp: Karte gerade halten, Glanz vermeiden, Nummer unten muss scharf sein.");
         return;
       }
 
-      const number = m[1];
+      const number = m[1]; // z.B. "082"
       setStatus(`Erkannt: ${m[0]} → Suche nach number:${number} …`);
 
-      // Breite Suche nach number
+      // 3) Suche
       const cards = await searchCards(`number:${number}`);
       if (!cards.length) {
         setStatus("");
-        setError("Keine Treffer. Versuch nochmal oder nutze später die manuelle Suche.");
+        setError("Nummer erkannt, aber keine Treffer. (Kann passieren, wenn mehrere Sets gleiche Nummern haben.)");
         return;
       }
 
@@ -79,7 +129,7 @@ export default function Scanner({ onClose, onCardAdded }: Props) {
         </div>
 
         <p className="text-sm text-gray-300 mb-3">
-          Tipp: Karte nah ran, gute Beleuchtung, Nummer unten muss scharf sein.
+          PC: Datei auswählen. Handy: sollte Kamera öffnen. Tipp: Glanz vermeiden, Nummer unten scharf.
         </p>
 
         <input
@@ -96,6 +146,14 @@ export default function Scanner({ onClose, onCardAdded }: Props) {
 
         {status && <div className="mt-3 text-sm text-gray-200">{status}</div>}
         {error && <div className="mt-3 text-sm text-red-300">{error}</div>}
+
+        {/* Debug: zeigt was OCR wirklich gelesen hat */}
+        {debugText && (
+          <details className="mt-3 text-sm text-gray-300">
+            <summary className="cursor-pointer">OCR Debug anzeigen</summary>
+            <pre className="mt-2 p-2 rounded bg-black/30 overflow-auto whitespace-pre-wrap">{debugText}</pre>
+          </details>
+        )}
 
         <div className="mt-4 space-y-2 max-h-[50vh] overflow-auto">
           {results.map((c) => {
