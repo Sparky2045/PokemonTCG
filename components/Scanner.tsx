@@ -1,3 +1,5 @@
+// SCANNER OCR VERSION - 123
+
 import React, { useMemo, useState } from "react";
 import { PokemonCard } from "../types";
 import { searchCards } from "../services/pokemonService";
