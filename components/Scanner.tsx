@@ -16,108 +16,122 @@ function eurFormat(v: number) {
   return (v || 0).toLocaleString("de-DE", { style: "currency", currency: "EUR" });
 }
 
-// Extra robust: 082/159, 82/159, 082-159, 82_159
-function findNumberPair(text: string) {
-  return text.match(/(\d{1,3})\s*[/\-_]\s*(\d{1,3})/);
+async function loadImage(file: File): Promise<HTMLImageElement> {
+  const img = new Image();
+  img.src = URL.createObjectURL(file);
+  await new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error("Image load failed"));
+  });
+  return img;
+}
+
+function cropCanvas(img: HTMLImageElement, crop: { x: number; y: number; w: number; h: number }, scale = 2) {
+  const c = document.createElement("canvas");
+  c.width = Math.floor(crop.w * scale);
+  c.height = Math.floor(crop.h * scale);
+  const ctx = c.getContext("2d")!;
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(img, crop.x, crop.y, crop.w, crop.h, 0, 0, c.width, c.height);
+
+  // leichte Kontrastverstärkung
+  const imageData = ctx.getImageData(0, 0, c.width, c.height);
+  const d = imageData.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    let v = (r * 0.299 + g * 0.587 + b * 0.114);
+    v = (v - 128) * 1.4 + 128;
+    v = Math.max(0, Math.min(255, v));
+    d[i] = d[i + 1] = d[i + 2] = v;
+  }
+  ctx.putImageData(imageData, 0, 0);
+
+  return c;
+}
+
+// versucht, aus OCR-Text eine plausible Pokémon-Karten-Namenszeile zu ziehen
+function guessName(text: string) {
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  // oft steht der Name allein in einer Zeile (z.B. "Regirock")
+  // wir nehmen die längste "saubere" Zeile ohne Zahlen
+  const candidates = lines
+    .map((l) => l.replace(/[^A-Za-zÄÖÜäöüß'\- ]/g, " ").replace(/\s+/g, " ").trim())
+    .filter((l) => l.length >= 3 && l.length <= 25)
+    .filter((l) => !/\d/.test(l));
+
+  if (!candidates.length) return "";
+
+  // bevorzugt 1-Wort oder 2-Wort Namen
+  candidates.sort((a, b) => {
+    const aw = a.split(" ").length;
+    const bw = b.split(" ").length;
+    if (aw !== bw) return aw - bw; // weniger Wörter zuerst
+    return b.length - a.length; // dann längere
+  });
+
+  return candidates[0];
 }
 
 export default function Scanner({ onClose, onCardAdded }: Props) {
   const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState<string>("");
+  const [status, setStatus] = useState("");
   const [results, setResults] = useState<PokemonCard[]>([]);
-  const [error, setError] = useState<string>("");
-
-  // manuelle Eingabe
-  const [manualNum, setManualNum] = useState("");
-  const [manualTotal, setManualTotal] = useState("");
+  const [error, setError] = useState("");
+  const [debugText, setDebugText] = useState("");
 
   const eur = useMemo(() => eurFormat, []);
-
-  async function runSearchByNumber(num: string, total?: string) {
-    setBusy(true);
-    setError("");
-    setResults([]);
-    try {
-      // Wenn wir total haben: versuch erst eng (weniger Treffer)
-      if (total) {
-        // printedTotal ist häufig korrekt; total ist ein Fallback
-        const tight = await searchCards(`number:${num} (set.printedTotal:${total} OR set.total:${total})`);
-        if (tight.length) {
-          setResults(tight);
-          setStatus("Treffer gefunden – bitte auswählen.");
-          return;
-        }
-      }
-
-      // sonst / falls eng nix: breite Suche nur nach Nummer
-      const cards = await searchCards(`number:${num}`);
-      if (!cards.length) {
-        setStatus("");
-        setError("Nummer erkannt/eingegeben, aber keine Treffer.");
-        return;
-      }
-      setResults(cards);
-      setStatus("Treffer gefunden – bitte auswählen.");
-    } catch (e: any) {
-      setStatus("");
-      setError(e?.message || "Suche fehlgeschlagen.");
-    } finally {
-      setBusy(false);
-    }
-  }
 
   async function handleFile(file: File) {
     setBusy(true);
     setError("");
     setResults([]);
-    setStatus("Erkennung läuft…");
+    setDebugText("");
+    setStatus("Erkennung läuft… (Name oben)");
 
-    // 1) Fallback aus Dateiname (bei dir funktioniert das direkt)
-    const fromName = findNumberPair(file.name);
-    if (fromName) {
-      const num = fromName[1];
-      const total = fromName[2];
-      setStatus(`Aus Dateiname erkannt: ${num}/${total} → Suche…`);
-      setManualNum(num);
-      setManualTotal(total);
-      await runSearchByNumber(num, total);
-      return;
-    }
-
-    // 2) OCR (nur wenn Dateiname nix hergibt)
     try {
-      setStatus("OCR läuft… (kann 10–30s dauern)");
       const Tesseract = await loadTesseract();
+      const img = await loadImage(file);
 
-      const img = new Image();
-      img.src = URL.createObjectURL(file);
-      await new Promise<void>((resolve, reject) => {
-        img.onload = () => resolve();
-        img.onerror = () => reject(new Error("Image load failed"));
-      });
+      // Wir croppen den oberen Bereich (Name sitzt dort groß)
+      // Bereich: obere ~18% der Karte, mittig etwas breiter
+      const crop = {
+        x: Math.floor(img.width * 0.08),
+        y: Math.floor(img.height * 0.02),
+        w: Math.floor(img.width * 0.84),
+        h: Math.floor(img.height * 0.18),
+      };
 
-      const canvas = document.createElement("canvas");
-      canvas.width = img.width;
-      canvas.height = img.height;
-      const ctx = canvas.getContext("2d")!;
-      ctx.drawImage(img, 0, 0);
+      const c = cropCanvas(img, crop, 2);
+      const dataUrl = c.toDataURL("image/png");
 
-      const { data } = await Tesseract.recognize(canvas.toDataURL("image/png"), "eng");
-      const text: string = data?.text || "";
+      const ocr = await Tesseract.recognize(dataUrl, "eng");
+      const rawText: string = ocr?.data?.text || "";
+      setDebugText(rawText);
 
-      const m = findNumberPair(text);
-      if (!m) {
+      const name = guessName(rawText);
+      if (!name) {
         setStatus("");
-        setError("Keine Kartennummer erkannt. Tipp: oder nutze die manuelle Eingabe unten.");
+        setError("Konnte den Kartennamen nicht lesen. Versuch: Karte gerade, Name oben klar im Bild.");
         return;
       }
 
-      const num = m[1];
-      const total = m[2];
-      setStatus(`OCR erkannt: ${num}/${total} → Suche…`);
-      setManualNum(num);
-      setManualTotal(total);
-      await runSearchByNumber(num, total);
+      setStatus(`Name erkannt: "${name}" → Suche…`);
+
+      // PokémonTCG Query: name:"Regirock"
+      const cards = await searchCards(`name:"${name.replace(/"/g, '\\"')}"`);
+
+      if (!cards.length) {
+        setStatus("");
+        setError(`Keine Treffer für "${name}".`);
+        return;
+      }
+
+      setResults(cards);
+      setStatus("Treffer gefunden – bitte auswählen.");
     } catch (e: any) {
       setStatus("");
       setError(e?.message || "Scan fehlgeschlagen.");
@@ -137,7 +151,7 @@ export default function Scanner({ onClose, onCardAdded }: Props) {
         </div>
 
         <p className="text-sm text-gray-300 mb-3">
-          PC: Datei auswählen. Handy: sollte Kamera öffnen.
+          PC: Datei auswählen. Handy: Kamera. Wir erkennen jetzt zuerst den <b>Namen oben</b> (stabiler als die Nummer).
         </p>
 
         <input
@@ -152,30 +166,15 @@ export default function Scanner({ onClose, onCardAdded }: Props) {
           className="block w-full text-sm text-gray-200"
         />
 
-        <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-2">
-          <input
-            className="px-3 py-2 rounded-lg bg-gray-800 border border-gray-700 text-white"
-            placeholder="Nummer (z.B. 082)"
-            value={manualNum}
-            onChange={(e) => setManualNum(e.target.value)}
-          />
-          <input
-            className="px-3 py-2 rounded-lg bg-gray-800 border border-gray-700 text-white"
-            placeholder="Total (z.B. 159)"
-            value={manualTotal}
-            onChange={(e) => setManualTotal(e.target.value)}
-          />
-          <button
-            disabled={busy || !manualNum.trim()}
-            onClick={() => runSearchByNumber(manualNum.trim(), manualTotal.trim() || undefined)}
-            className="px-4 py-2 rounded-lg bg-yellow-400 text-gray-900 font-semibold hover:bg-yellow-500 disabled:opacity-50"
-          >
-            Suchen
-          </button>
-        </div>
-
         {status && <div className="mt-3 text-sm text-gray-200">{status}</div>}
         {error && <div className="mt-3 text-sm text-red-300">{error}</div>}
+
+        {debugText && (
+          <details className="mt-3 text-sm text-gray-300">
+            <summary className="cursor-pointer">OCR Debug anzeigen</summary>
+            <pre className="mt-2 p-2 rounded bg-black/30 overflow-auto whitespace-pre-wrap">{debugText}</pre>
+          </details>
+        )}
 
         <div className="mt-4 space-y-2 max-h-[50vh] overflow-auto">
           {results.map((c) => {
