@@ -1,6 +1,5 @@
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { identifyCard } from '../services/geminiService';
 import { fetchCardData } from '../services/pokemonService';
 import { PokemonCard } from '../types';
 import Modal from './Modal';
