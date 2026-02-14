@@ -19,6 +19,13 @@ async function fetchJson(url: string) {
 }
 
 export async function searchCards(query: string): Promise<PokemonCard[]> {
-  const json = await fetchJson(`/api/pokemontcg?q=${encodeURIComponent(query)}`);
+  // 👇 Query enger machen (extrem wichtig)
+  const safeQuery = `${query} supertype:pokemon`;
+
+  const json = await fetchJson(
+    `/api/pokemontcg?q=${encodeURIComponent(safeQuery)}`
+  );
+
   return json?.data ?? [];
 }
+
