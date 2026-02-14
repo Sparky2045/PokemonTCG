@@ -1,158 +1,125 @@
+import React, { useMemo, useState } from "react";
+import { PokemonCard } from "../types";
+import { searchCards } from "../services/pokemonService";
 
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { fetchCardData } from '../services/pokemonService';
-import { PokemonCard } from '../types';
-import Modal from './Modal';
-import Loader from './Loader';
-
-interface ScannerProps {
-  onClose: () => void;
-  onCardAdded: (card: PokemonCard) => void;
+// OCR wird nur geladen, wenn du wirklich scannst
+async function loadTesseract() {
+  const mod = await import("https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js");
+  return (mod as any).default || (window as any).Tesseract;
 }
 
-type Status = 'idle' | 'initializing' | 'scanning' | 'capturing' | 'identifying' | 'fetching' | 'result' | 'error';
-
-const Scanner: React.FC<ScannerProps> = ({ onClose, onCardAdded }) => {
-  const [status, setStatus] = useState<Status>('idle');
-  const [error, setError] = useState<string | null>(null);
-  const [foundCard, setFoundCard] = useState<PokemonCard | null>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-
-  const startCamera = useCallback(async () => {
-    setStatus('initializing');
-    try {
-      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-          video: { facingMode: 'environment' } 
-        });
-        streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play();
-          setStatus('scanning');
-        }
-      } else {
-        throw new Error('Camera not supported');
-      }
-    } catch (err) {
-      console.error(err);
-      setError('Could not access camera. Please check permissions.');
-      setStatus('error');
-    }
-  }, []);
-
-  const stopCamera = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
-  }, []);
-
-  useEffect(() => {
-    startCamera();
-    return () => {
-      stopCamera();
-    };
-  }, [startCamera, stopCamera]);
-
-  const capturePhoto = async () => {
-    if (!videoRef.current || !canvasRef.current) return;
-    setStatus('capturing');
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const context = canvas.getContext('2d');
-    if (context) {
-        context.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
-        const imageDataUrl = canvas.toDataURL('image/jpeg', 0.9);
-        const base64Data = imageDataUrl.split(',')[1];
-        
-        stopCamera();
-        setStatus('identifying');
-        
-        try {
-            const identified = await identifyCard(base64Data);
-            if (identified && identified.name && identified.set) {
-                setStatus('fetching');
-                const cardData = await fetchCardData(identified.name, identified.set);
-                if (cardData) {
-                    setFoundCard(cardData);
-                    setStatus('result');
-                } else {
-                    throw new Error(`Card '${identified.name}' from set '${identified.set}' not found.`);
-                }
-            } else {
-                throw new Error('Could not identify the card. Please try again with a clearer image.');
-            }
-        } catch (err: any) {
-            setError(err.message || 'An unknown error occurred.');
-            setStatus('error');
-        }
-    }
-  };
-
-  const resetScanner = () => {
-    setError(null);
-    setFoundCard(null);
-    startCamera();
-  }
-
-  const statusMessages: Record<Status, string> = {
-    idle: 'Starting...',
-    initializing: 'Initializing camera...',
-    scanning: 'Position card and capture',
-    capturing: 'Capturing photo...',
-    identifying: 'Identifying card...',
-    fetching: 'Fetching card data...',
-    result: 'Card Found!',
-    error: 'Error',
-  };
-
-  return (
-    <Modal isOpen={true} onClose={onClose}>
-      <div className="bg-gray-800 rounded-lg p-4 max-w-md w-full mx-auto text-center">
-        <h2 className="text-xl font-bold mb-4">{statusMessages[status]}</h2>
-        
-        <div className="relative w-full aspect-[3/4] bg-gray-900 rounded-lg overflow-hidden mb-4">
-          <video ref={videoRef} className={`w-full h-full object-cover ${status === 'scanning' ? 'block' : 'hidden'}`} playsInline />
-          <canvas ref={canvasRef} className={`w-full h-full object-cover ${status !== 'scanning' ? 'block' : 'hidden'}`} />
-
-          {(status === 'identifying' || status === 'fetching' || status === 'initializing') && <Loader />}
-        </div>
-
-        {status === 'scanning' && <button onClick={capturePhoto} className="w-full bg-yellow-400 text-gray-900 font-bold py-3 px-4 rounded-lg hover:bg-yellow-500">Capture</button>}
-
-        {status === 'result' && foundCard && (
-          <div>
-            <img src={foundCard.images.small} alt={foundCard.name} className="w-40 mx-auto rounded-lg mb-2" />
-            <p className="font-bold">{foundCard.name}</p>
-            <p className="text-gray-400">{foundCard.set.name}</p>
-            <p className="text-yellow-400 font-semibold text-lg">€{(foundCard.cardmarket?.prices?.averageSellPrice ?? 0).toFixed(2)}</p>
-            <div className="flex gap-2 mt-4">
-              <button onClick={resetScanner} className="w-full bg-gray-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-gray-700">Scan Another</button>
-              <button onClick={() => onCardAdded(foundCard)} className="w-full bg-green-500 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-600">Add to Collection</button>
-            </div>
-          </div>
-        )}
-
-        {status === 'error' && (
-          <div>
-            <p className="text-red-400 mb-4">{error}</p>
-            <button onClick={resetScanner} className="w-full bg-yellow-400 text-gray-900 font-bold py-3 px-4 rounded-lg hover:bg-yellow-500">Try Again</button>
-          </div>
-        )}
-
-        <button onClick={onClose} className="absolute top-2 right-2 text-gray-500 hover:text-white">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-          </svg>
-        </button>
-      </div>
-    </Modal>
-  );
+type Props = {
+  onClose: () => void;
+  onCardAdded: (card: PokemonCard) => void;
 };
 
-export default Scanner;
+export default function Scanner({ onClose, onCardAdded }: Props) {
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<string>("");
+  const [results, setResults] = useState<PokemonCard[]>([]);
+  const [error, setError] = useState<string>("");
+
+  const eur = useMemo(
+    () => (v: number) => (v || 0).toLocaleString("de-DE", { style: "currency", currency: "EUR" }),
+    []
+  );
+
+  async function handleFile(file: File) {
+    setBusy(true);
+    setError("");
+    setResults([]);
+    setStatus("OCR läuft… (10–30s)");
+
+    try {
+      const Tesseract = await loadTesseract();
+      const imgUrl = URL.createObjectURL(file);
+
+      const { data } = await Tesseract.recognize(imgUrl, "eng");
+      const text: string = data?.text || "";
+
+      // Suche nach Muster 80/198 oder 80 / 198
+      const m = text.match(/(\d{1,3})\s*\/\s*(\d{1,3})/);
+      if (!m) {
+        setStatus("");
+        setError("Keine Kartennummer erkannt. Versuch ein schärferes Foto (Nummer unten gut sichtbar).");
+        return;
+      }
+
+      const number = m[1];
+      setStatus(`Erkannt: ${m[0]} → Suche nach number:${number} …`);
+
+      // Breite Suche nach number
+      const cards = await searchCards(`number:${number}`);
+      if (!cards.length) {
+        setStatus("");
+        setError("Keine Treffer. Versuch nochmal oder nutze später die manuelle Suche.");
+        return;
+      }
+
+      setResults(cards);
+      setStatus("Treffer gefunden – bitte auswählen.");
+    } catch (e: any) {
+      setStatus("");
+      setError(e?.message || "Scan fehlgeschlagen.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/70 flex items-end sm:items-center justify-center p-4">
+      <div className="w-full max-w-xl rounded-2xl bg-gray-900 border border-gray-700 p-4">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-lg font-bold">Karte scannen (OCR)</h2>
+          <button onClick={onClose} className="px-3 py-2 rounded-lg bg-gray-800 hover:bg-gray-700">
+            Schließen
+          </button>
+        </div>
+
+        <p className="text-sm text-gray-300 mb-3">
+          Tipp: Karte nah ran, gute Beleuchtung, Nummer unten muss scharf sein.
+        </p>
+
+        <input
+          type="file"
+          accept="image/*"
+          capture="environment"
+          disabled={busy}
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) handleFile(f);
+          }}
+          className="block w-full text-sm text-gray-200 file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-yellow-400 file:text-gray-900 file:font-semibold hover:file:bg-yellow-500"
+        />
+
+        {status && <div className="mt-3 text-sm text-gray-200">{status}</div>}
+        {error && <div className="mt-3 text-sm text-red-300">{error}</div>}
+
+        <div className="mt-4 space-y-2 max-h-[50vh] overflow-auto">
+          {results.map((c) => {
+            const price =
+              c.cardmarket?.prices?.trendPrice ??
+              c.cardmarket?.prices?.averageSellPrice ??
+              0;
+
+            return (
+              <button
+                key={c.id}
+                onClick={() => onCardAdded(c)}
+                className="w-full text-left flex gap-3 p-3 rounded-xl bg-gray-800 hover:bg-gray-700 border border-gray-700"
+              >
+                <img src={c.images?.small} className="w-14 rounded-lg" />
+                <div>
+                  <div className="font-bold">{c.name}</div>
+                  <div className="text-sm text-gray-300">
+                    {c.set?.name} • #{c.number} • {eur(Number(price))}
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
