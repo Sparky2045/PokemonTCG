@@ -16,44 +16,76 @@ function eurFormat(v: number) {
   return (v || 0).toLocaleString("de-DE", { style: "currency", currency: "EUR" });
 }
 
-// Bild vorbereiten: unteren Bereich croppen + hochskalieren + Kontrast (simple)
-async function preprocessBottomCrop(file: File): Promise<HTMLCanvasElement> {
-  const img = new Image();
-  img.src = URL.createObjectURL(file);
-  await new Promise<void>((resolve, reject) => {
-    img.onload = () => resolve();
-    img.onerror = () => reject(new Error("Image load failed"));
-  });
+function canvasFromImage(img: HTMLImageElement) {
+  const c = document.createElement("canvas");
+  c.width = img.width;
+  c.height = img.height;
+  const ctx = c.getContext("2d")!;
+  ctx.drawImage(img, 0, 0);
+  return c;
+}
 
-  // Crop: untere ~32% der Karte (da sitzt die Nummer)
-  const cropY = Math.floor(img.height * 0.68);
-  const cropH = img.height - cropY;
-  const cropW = img.width;
+function rotateCanvas(src: HTMLCanvasElement, deg: 0 | 90 | 180 | 270) {
+  if (deg === 0) return src;
 
-  // Hochskalieren x2 für OCR
-  const scale = 2;
-  const canvas = document.createElement("canvas");
-  canvas.width = cropW * scale;
-  canvas.height = cropH * scale;
-  const ctx = canvas.getContext("2d")!;
+  const c = document.createElement("canvas");
+  const ctx = c.getContext("2d")!;
+  const rad = (deg * Math.PI) / 180;
+
+  if (deg === 90 || deg === 270) {
+    c.width = src.height;
+    c.height = src.width;
+  } else {
+    c.width = src.width;
+    c.height = src.height;
+  }
+
+  ctx.translate(c.width / 2, c.height / 2);
+  ctx.rotate(rad);
+  ctx.drawImage(src, -src.width / 2, -src.height / 2);
+  return c;
+}
+
+// Crop-Bereiche: unten links / unten mitte / unten rechts
+function cropZone(src: HTMLCanvasElement, zone: "bl" | "bm" | "br") {
+  const w = src.width;
+  const h = src.height;
+
+  const cropH = Math.floor(h * 0.35); // unteres 35%
+  const cropY = h - cropH;
+
+  // wir nehmen nur ~55% Breite, je nach Zone verschoben
+  const cropW = Math.floor(w * 0.55);
+  let cropX = 0;
+  if (zone === "bm") cropX = Math.floor((w - cropW) / 2);
+  if (zone === "br") cropX = w - cropW;
+
+  const scale = 2; // hochskalieren
+  const c = document.createElement("canvas");
+  c.width = cropW * scale;
+  c.height = cropH * scale;
+  const ctx = c.getContext("2d")!;
   ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(img, 0, cropY, cropW, cropH, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(src, cropX, cropY, cropW, cropH, 0, 0, c.width, c.height);
 
-  // Simple Kontrast/Grayscale (hilft bei Glanz)
-  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  // Grayscale + Kontrast (hilft extrem bei kleiner Schrift)
+  const imageData = ctx.getImageData(0, 0, c.width, c.height);
   const d = imageData.data;
   for (let i = 0; i < d.length; i += 4) {
     const r = d[i], g = d[i + 1], b = d[i + 2];
-    // grayscale
     let v = (r * 0.299 + g * 0.587 + b * 0.114);
-    // contrast boost
-    v = (v - 128) * 1.35 + 128;
+    v = (v - 128) * 1.5 + 128; // stärkerer Kontrast
     v = Math.max(0, Math.min(255, v));
     d[i] = d[i + 1] = d[i + 2] = v;
   }
   ctx.putImageData(imageData, 0, 0);
 
-  return canvas;
+  return c;
+}
+
+function extractNumber(text: string) {
+  // akzeptiert 082/159, 82/159, 082 / 159, etc.
+  return text.match(/(\d{1,3})\s*\/\s*(\d{1,3})/);
 }
 
 export default function Scanner({ onClose, onCardAdded }: Props) {
@@ -70,41 +102,69 @@ export default function Scanner({ onClose, onCardAdded }: Props) {
     setError("");
     setResults([]);
     setDebugText("");
-    setStatus("OCR läuft… (10–30s)");
+    setStatus("OCR läuft… (mehrere Versuche)");
 
     try {
       const Tesseract = await loadTesseract();
 
-      // 1) Bild vorbereiten (unten croppen + verbessern)
-      const canvas = await preprocessBottomCrop(file);
-      const dataUrl = canvas.toDataURL("image/png");
-
-      // 2) OCR mit Whitelist nur für Nummern + Slash
-      const result = await Tesseract.recognize(dataUrl, "eng", {
-        tessedit_char_whitelist: "0123456789/",
-        // PSM 6: block of text; PSM 7: single line (manchmal besser)
-        tessedit_pageseg_mode: "6",
+      const img = new Image();
+      img.src = URL.createObjectURL(file);
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error("Image load failed"));
       });
 
-      const text: string = result?.data?.text || "";
-      setDebugText(text);
+      const base = canvasFromImage(img);
 
-      // robustere Regex: findet 082/159 auch mit Leerzeichen oder Zeilenumbrüchen
-      const m = text.match(/(\d{1,3})\s*\/\s*(\d{1,3})/);
-      if (!m) {
+      // Wir testen mehrere Rotationen + Zonen
+      const rotations: (0 | 90 | 180 | 270)[] = [0, 90, 180, 270];
+      const zones: ("bl" | "bm" | "br")[] = ["bl", "bm", "br"];
+
+      let found: RegExpMatchArray | null = null;
+      let foundDebug = "";
+      let bestTryLog = "";
+
+      for (const deg of rotations) {
+        const rotated = rotateCanvas(base, deg);
+
+        for (const zone of zones) {
+          const cropped = cropZone(rotated, zone);
+          const dataUrl = cropped.toDataURL("image/png");
+
+          // Wichtig: KEIN zu aggressives Whitelist-Setup, sonst kommt manchmal leer zurück.
+          const r = await Tesseract.recognize(dataUrl, "eng");
+          const text: string = r?.data?.text || "";
+          const cleaned = text.replace(/[^\d\/\s]/g, ""); // wir filtern erst nachträglich
+
+          bestTryLog += `\n--- try rotation=${deg} zone=${zone} ---\nRAW:\n${text}\nCLEAN:\n${cleaned}\n`;
+
+          const m = extractNumber(cleaned);
+          if (m) {
+            found = m;
+            foundDebug = `rotation=${deg}, zone=${zone}\n` + cleaned;
+            break;
+          }
+        }
+        if (found) break;
+      }
+
+      setDebugText(bestTryLog);
+
+      if (!found) {
         setStatus("");
-        setError("Keine Kartennummer erkannt. Tipp: Karte gerade halten, Glanz vermeiden, Nummer unten muss scharf sein.");
+        setError(
+          "Keine Kartennummer erkannt. Öffne 'OCR Debug anzeigen' und schick mir den Text – dann sehe ich, was OCR wirklich liest."
+        );
         return;
       }
 
-      const number = m[1]; // z.B. "082"
-      setStatus(`Erkannt: ${m[0]} → Suche nach number:${number} …`);
+      const number = found[1]; // z.B. 082
+      setStatus(`Erkannt: ${found[0]} (aus ${foundDebug}) → Suche nach number:${number} …`);
 
-      // 3) Suche
       const cards = await searchCards(`number:${number}`);
       if (!cards.length) {
         setStatus("");
-        setError("Nummer erkannt, aber keine Treffer. (Kann passieren, wenn mehrere Sets gleiche Nummern haben.)");
+        setError("Nummer erkannt, aber keine Treffer. (Kann passieren, wenn verschiedene Sets gleiche Nummern haben.)");
         return;
       }
 
@@ -129,7 +189,7 @@ export default function Scanner({ onClose, onCardAdded }: Props) {
         </div>
 
         <p className="text-sm text-gray-300 mb-3">
-          PC: Datei auswählen. Handy: sollte Kamera öffnen. Tipp: Glanz vermeiden, Nummer unten scharf.
+          PC: Datei auswählen. Handy: Kamera. Der Scanner probiert jetzt automatisch Drehungen & Bereiche.
         </p>
 
         <input
@@ -147,7 +207,6 @@ export default function Scanner({ onClose, onCardAdded }: Props) {
         {status && <div className="mt-3 text-sm text-gray-200">{status}</div>}
         {error && <div className="mt-3 text-sm text-red-300">{error}</div>}
 
-        {/* Debug: zeigt was OCR wirklich gelesen hat */}
         {debugText && (
           <details className="mt-3 text-sm text-gray-300">
             <summary className="cursor-pointer">OCR Debug anzeigen</summary>
