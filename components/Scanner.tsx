@@ -89,7 +89,7 @@ export default function Scanner({ onClose, onCardAdded }: Props) {
             const f = e.target.files?.[0];
             if (f) handleFile(f);
           }}
-          className="block w-full text-sm text-gray-200 file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-yellow-400 file:text-gray-900 file:font-semibold hover:file:bg-yellow-500"
+          className="block w-full text-sm text-gray-200"
         />
 
         {status && <div className="mt-3 text-sm text-gray-200">{status}</div>}
